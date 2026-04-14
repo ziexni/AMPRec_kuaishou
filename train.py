@@ -258,7 +258,7 @@ if __name__ == '__main__':
 
         'lr':           2e-3,
         'weight_decay': 5e-6,
-        'batch_size':   128,
+        'batch_size':   32,
         'num_epochs':   100,
         'eval_every':   5,
         'topk':         10,
