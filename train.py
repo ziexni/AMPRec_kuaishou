@@ -35,13 +35,12 @@ def evaluate(model, dataset, rep_dict, graph_structure, device,
 
         target = eval_dict[u][0]['item_id']
 
-        # negative sampling — train만 제외, seed 없음
         rated = dataset.train_item_dict[u] | {0}
         candidates = [target]
         for _ in range(num_neg):
-            neg = np.random.randint(1, dataset.num_items)
+            neg = np.random.randint(0, dataset.num_items)
             while neg in rated:
-                neg = np.random.randint(1, dataset.num_items)
+                neg = np.random.randint(0, dataset.num_items)
             candidates.append(neg)
 
         with torch.no_grad():
@@ -49,7 +48,7 @@ def evaluate(model, dataset, rep_dict, graph_structure, device,
                 user_seq, rep_dict, graph_structure, device
             )
 
-        cand_ids = torch.tensor([c - 1 for c in candidates], dtype=torch.long, device=device)
+        cand_ids = torch.tensor(candidates, dtype=torch.long, device=device)
         cand_t   = mod_title[cand_ids]
         cand_c   = mod_category[cand_ids]
 
@@ -76,10 +75,20 @@ def train(config):
     print("Loading data...")
     interactions_df = pd.read_pickle(config['interaction_path'])
 
-    item_df    = interactions_df[['video_id', 'title', 'category']].drop_duplicates('video_id').reset_index(drop=True)
+    # ✅ item_df 기준으로 통일
+    item_df = interactions_df[['video_id', 'title', 'category']]\
+        .drop_duplicates('video_id')\
+        .reset_index(drop=True)
+
+    # ✅ 0 ~ N-1 reindex
+    id_map     = {vid: idx for idx, vid in enumerate(item_df['video_id'])}
+    num_items  = len(item_df)
     title_feat = np.stack(item_df['title'].values)
-    num_items  = interactions_df['video_id'].nunique()
     print(f"Items: {num_items}\n")
+
+    # id_map을 interactions_df에 적용
+    interactions_df = interactions_df.copy()
+    interactions_df['video_id'] = interactions_df['video_id'].map(id_map)
 
     interactions_df, rep_dict, graph_structure = preprocess_kuaishou(
         interactions_df, item_df, title_feat,
@@ -89,8 +98,10 @@ def train(config):
         signal_params=config.get('signal_params'),
     )
 
+    # ✅ num_items를 dataset에 전달
     dataset = MicroVideoDataset(
-        interactions_df, max_seq_len=config['max_seq_len'], mode='train'
+        interactions_df, num_items=num_items,
+        max_seq_len=config['max_seq_len'], mode='train'
     )
 
     import ast
@@ -115,6 +126,11 @@ def train(config):
             for c in cats: category_feat[idx, int(c)] = 1.0
         else:
             category_feat[idx, int(cats)] = 1.0
+
+    assert title_feat.shape[0] == num_items, \
+        f"title_feat mismatch: {title_feat.shape[0]} vs {num_items}"
+    assert category_feat.shape[0] == num_items, \
+        f"category_feat mismatch: {category_feat.shape[0]} vs {num_items}"
 
     model = MicroVideoRec(
         num_items=num_items,
@@ -143,7 +159,6 @@ def train(config):
     best_val_ndcg  = 0.0
     best_test_ndcg = best_test_hr = best_test_mrr = 0.0
     num_decreases  = 0
-
     sample_indices = list(range(len(dataset.samples)))
 
     for epoch in range(config['num_epochs']):
@@ -163,9 +178,9 @@ def train(config):
                 u, input_seq, target = dataset.samples[idx]
 
                 rated = dataset.train_item_dict[u] | {0}
-                neg = np.random.randint(1, dataset.num_items)
+                neg = np.random.randint(0, dataset.num_items)
                 while neg in rated:
-                    neg = np.random.randint(1, dataset.num_items)
+                    neg = np.random.randint(0, dataset.num_items)
 
                 batch_sequences.append((input_seq, target, neg))
 
@@ -226,16 +241,14 @@ def train(config):
 
 if __name__ == '__main__':
     config = {
-        'interaction_path': './kuaishou_preprocess.pkl',
-        'save_path':        './best_model.pt',
+        'interaction_path': '/kaggle/input/datasets/jieunl2/kuaishou/kuaishou_preprocess.pkl',
+        'save_path':        '/kaggle/working/output/best_model.pt',
 
-        # Preprocessing
         'epsilon':      0.4,
         'topk_sim':     30,
         'lambda_decay': 0.1,
         'signal_params': {'a': 3.0, 'b': 2.0, 'c': 4.5},
 
-        # Model
         'dim':                    128,
         'num_heads':              4,
         'num_transformer_layers': 3,
@@ -243,10 +256,9 @@ if __name__ == '__main__':
         'dropout':                0.1,
         'max_seq_len':            50,
 
-        # Training
         'lr':           2e-3,
         'weight_decay': 5e-6,
-        'batch_size':   256,
+        'batch_size':   128,
         'num_epochs':   100,
         'eval_every':   5,
         'topk':         10,
@@ -256,4 +268,6 @@ if __name__ == '__main__':
         'min_lr':       1e-6,
     }
 
+    import os
+    os.makedirs('/kaggle/working/output', exist_ok=True)
     train(config)
