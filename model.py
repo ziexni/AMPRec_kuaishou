@@ -11,41 +11,23 @@ class BehaviorAwareGCNLayer(nn.Module):
         nn.init.xavier_normal_(self.W.weight)
         nn.init.xavier_normal_(self.self_linear.weight)
 
-        # asymmetric gate
-        self.alpha     = nn.Parameter(torch.tensor(1.0))
-        self.beta      = nn.Parameter(torch.tensor(1.0))
-        self.alpha_self = nn.Parameter(torch.tensor(1.0))
-        # learnable temperature
-        self.temp      = nn.Parameter(torch.tensor(2.0))
-
     def forward(self, x, edge_index, sim_weight, rep, node_signal):
         row, col = edge_index
 
-        h_j = self.W(x)[col]
-
-        # gate = 신뢰도만 (rep 기반), asymmetric + temperature
-        gate_input = self.alpha * rep[row] + self.beta * rep[col]
-        gate = torch.sigmoid(gate_input / self.temp).unsqueeze(-1)
-
-        # sim: row-wise normalize (이웃 간 상대적 중요도)
-        sim_norm = torch.zeros_like(sim_weight)
-        sim_norm.scatter_add_(0, row, sim_weight)
-        sim = (sim_weight / (sim_norm[row] + 1e-6)).unsqueeze(-1)
-
-        # signal: 원래 철학 유지 — negative는 repulsion, positive는 attraction
-        s_j = torch.tanh(node_signal[col]).unsqueeze(-1)  # tanh로 bounded
-        msg = sim * gate * s_j * h_j
+        h_j  = self.W(x)[col]
+        gate = torch.sigmoid(rep[row] + rep[col]).unsqueeze(-1)
+        sim  = sim_weight.unsqueeze(-1)
+        s_j  = node_signal[col].unsqueeze(-1)
+        msg  = sim * gate * s_j * h_j
 
         out = torch.zeros_like(x)
         out.scatter_add_(0, row.unsqueeze(-1).expand_as(msg), msg)
 
-        # weighted degree normalization
         deg = torch.zeros(x.size(0), device=x.device)
-        deg.scatter_add_(0, row, gate.squeeze(-1))
+        deg.scatter_add_(0, row, torch.ones_like(row, dtype=torch.float))
         out = out / (deg.unsqueeze(-1) + 1e-6)
 
-        # self connection (신뢰도만)
-        gate_self = torch.sigmoid(self.alpha_self * rep / self.temp).unsqueeze(-1)
+        gate_self = torch.sigmoid(rep).unsqueeze(-1)
         out = out + gate_self * self.self_linear(x)
 
         return F.leaky_relu(out)
@@ -72,8 +54,8 @@ class TimeAwarePE(nn.Module):
     def forward(self, timestamps):
         t_min = timestamps.min(dim=1, keepdim=True).values
         t_max = timestamps.max(dim=1, keepdim=True).values
-        timestamps_norm = (timestamps - t_min) / (t_max - t_min + 1e-8)
-        return self.proj(timestamps_norm.unsqueeze(-1))
+        t_norm = (timestamps - t_min) / (t_max - t_min + 1e-8)
+        return self.proj(t_norm.unsqueeze(-1))
 
 
 class SequenceEncoder(nn.Module):
@@ -90,14 +72,13 @@ class SequenceEncoder(nn.Module):
     def forward(self, x, timestamps):
         if x.size(1) == 1:
             return x.squeeze(1)
-        pe = self.time_pe(timestamps)
-        x  = x + pe
-        x  = self.encoder(x)
-        x  = self.norm(x)
-        scores   = self.attn_pool(x).squeeze(-1)
-        scores   = F.softmax(scores, dim=-1).unsqueeze(-1)
-        user_emb = (x * scores).sum(dim=1)
-        return user_emb
+        pe     = self.time_pe(timestamps)
+        x      = x + pe
+        x      = self.encoder(x)
+        x      = self.norm(x)
+        scores = self.attn_pool(x).squeeze(-1)
+        scores = F.softmax(scores, dim=-1).unsqueeze(-1)
+        return (x * scores).sum(dim=1)
 
 
 class CrossAttributeAttention(nn.Module):
@@ -148,11 +129,18 @@ class MicroVideoRec(nn.Module):
 
         self.cross_attention = CrossAttributeAttention(dim, num_heads)
 
-        # learnable lambda for signal aggregation
+        # learnable lambda for signal aggregation (mean + λ·max_abs)
         self.lam_raw = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
 
     def _aggregate_signals(self, item_ids_t, signals_t, reps_t, device):
-        """signal = mean + λ·max_abs, rep = log1p + z-score"""
+        """
+        signal = mean + λ·max_abs
+        - mean: frequency 정보 보존
+        - max_abs: 극단적 행동(강한 선호/회피) 보존
+        - λ: learnable (sigmoid로 [0,1] 보장)
+
+        rep = log1p + z-score
+        """
         signal_mean   = torch.zeros(self.num_items, dtype=torch.float, device=device)
         signal_maxabs = torch.zeros(self.num_items, dtype=torch.float, device=device)
         rep_full      = torch.zeros(self.num_items, dtype=torch.float, device=device)
@@ -173,9 +161,9 @@ class MicroVideoRec(nn.Module):
         lam         = torch.sigmoid(self.lam_raw)
         signal_full = signal_mean + lam * signal_maxabs
 
-        rep_log  = torch.log1p(rep_full)
-        rep_mean = rep_log.mean()
-        rep_std  = rep_log.std() + 1e-6
+        rep_log    = torch.log1p(rep_full)
+        rep_mean   = rep_log.mean()
+        rep_std    = rep_log.std() + 1e-6
         rep_scaled = (rep_log - rep_mean) / rep_std
 
         return signal_full, rep_scaled
@@ -187,9 +175,9 @@ class MicroVideoRec(nn.Module):
         timestamps   = []
 
         for interaction in user_sequence:
-            i = interaction['item_id'] - 1
+            i = interaction['item_id']  # 0-indexed (reindex됨)
             u = interaction['user_id']
-            item_ids.append(i)
+            item_ids.append(max(0, min(i, self.num_items - 1)))
             node_signals.append(interaction['node_signal'])
             reps.append(float(rep_dict.get((u, i), 0)))
             timestamps.append(interaction['timestamp'])
@@ -204,6 +192,7 @@ class MicroVideoRec(nn.Module):
         reps_t = torch.tensor(reps,         dtype=torch.float, device=device)
         ts_t   = torch.tensor(timestamps,   dtype=torch.float, device=device)
 
+        # signal aggregation: mean + λ·max_abs
         signal_full, rep_scaled = self._aggregate_signals(ids_t, sigs_t, reps_t, device)
 
         base_title    = self.title_proj(self.title_feat)
@@ -237,22 +226,21 @@ class MicroVideoRec(nn.Module):
         return (u_title * i_title).sum(-1) + (u_category * i_category).sum(-1)
 
     def compute_loss(self, batch_sequences, rep_dict, graph_structure, device):
-        """BPR loss — 원래 구조 그대로"""
         batch_losses = []
         for user_seq, target, negative in batch_sequences:
             u_title, u_category, mod_title, mod_category = self.forward_user(
                 user_seq, rep_dict, graph_structure, device
             )
-            pos_t = mod_title[target - 1];    pos_c = mod_category[target - 1]
-            neg_t = mod_title[negative - 1];  neg_c = mod_category[negative - 1]
+            t_idx = min(target,   self.num_items - 1)
+            n_idx = min(negative, self.num_items - 1)
 
             pos_score = self.compute_score(
                 u_title.unsqueeze(0), u_category.unsqueeze(0),
-                pos_t.unsqueeze(0),   pos_c.unsqueeze(0)
+                mod_title[t_idx].unsqueeze(0), mod_category[t_idx].unsqueeze(0)
             )
             neg_score = self.compute_score(
                 u_title.unsqueeze(0), u_category.unsqueeze(0),
-                neg_t.unsqueeze(0),   neg_c.unsqueeze(0)
+                mod_title[n_idx].unsqueeze(0), mod_category[n_idx].unsqueeze(0)
             )
             batch_losses.append(-torch.log(torch.sigmoid(pos_score - neg_score) + 1e-8))
 
