@@ -9,7 +9,7 @@ def compute_node_signal(watch_ratio, watch_seconds, a=3.0, b=2.0, c=4.5):
     watch_ratio_normalized = watch_ratio / 100.0
     watch_ratio_clipped = np.clip(watch_ratio_normalized, 0.0, 2.0)
     raw_signal = a * watch_ratio_clipped + b * np.log1p(watch_seconds) - c
-    return np.tanh(raw_signal)
+    return raw_signal
 
 
 def build_repetition_dict_temporal(interactions_df, lambda_decay=0.1):
